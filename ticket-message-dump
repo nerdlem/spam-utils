@@ -1,0 +1,76 @@
+#!/usr/bin/env perl
+
+# A simple tool to export messages sent to RT tickets
+#
+# © 2018, Luis E. Muñoz
+
+use strict;
+use warnings;
+
+use DBI;
+use Email::MIME;
+use File::Slurp;
+use Getopt::Long;
+use Email::Simple;
+
+my $dsn;
+
+GetOptions( 'dsn=s' => \$dsn, );
+
+die "Must specify DSN with --dsn"
+  unless $dsn;
+
+my $dbh = DBI->connect(
+    $dsn, undef, undef,
+    {
+        RaiseError => 1,
+    }
+);
+
+my $sth_att = $dbh->prepare(<<__SQL__);
+SELECT a.id, a.transactionid, a.parent, a.messageid,
+       a.subject, a.filename, a.contenttype, a.contentencoding,
+       a.content, a.headers, a.creator, a.created, a.contentindex
+FROM Tickets t
+     JOIN Transactions tx
+          ON Tx.objecttype = 'RT::Ticket'
+             AND Tx.objectid = t.id
+             AND Tx.type = 'Create'
+     JOIN Attachments a
+          ON a.transactionid = tx.id
+WHERE t.id = ?
+ORDER BY a.parent
+__SQL__
+
+for my $ticket (@ARGV) {
+    $sth_att->execute($ticket);
+    my $email;
+    while ( my $row = $sth_att->fetchrow_hashref ) {
+        my $part = Email::MIME->create( attributes => { charset => 'UTF-8' } );
+        prepare_header( $row->{headers}, $part );
+        $part->body_set( $row->{content} );
+
+        # The top part triggers initialization of $email
+        if ( $row->{parent} == 0 ) {
+            $email = $part;
+        }
+        else {
+            $email->parts_add( [$part] );
+        }
+    }
+    my $dest = sprintf( 'rt-%s.eml', $ticket );
+    write_file( $dest, $email->as_string )
+      or die "Failed to dump ticket $ticket message to $dest: $!";
+}
+
+sub prepare_header {
+    my ( $h, $part ) = @_;
+
+    $h =~ s{(?mx)^From \s .+ \n}{};
+    my $msg = Email::Simple->new($h);
+
+    for my $label ( $msg->header_names ) {
+        next if $label =~ m{^X-RT-};
+        $part->header_str_set( $label, $msg->header($label) );
+    }
+}
