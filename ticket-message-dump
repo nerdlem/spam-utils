@@ -14,8 +14,9 @@ use Getopt::Long;
 use Email::Simple;
 
 my $dsn;
+my $debug = 0;
 
-GetOptions( 'dsn=s' => \$dsn, );
+GetOptions( 'dsn=s' => \$dsn, 'debug' => \$debug );
 
 die "Must specify DSN with --dsn"
   unless $dsn;
@@ -30,7 +31,7 @@ my $dbh = DBI->connect(
 my $sth_att = $dbh->prepare(<<__SQL__);
 SELECT a.id, a.transactionid, a.parent, a.messageid,
        a.subject, a.filename, a.contenttype, a.contentencoding,
-       a.content, a.headers, a.creator, a.created, a.contentindex
+       a.content, a.headers, a.creator, a.created
 FROM Tickets t
      JOIN Transactions tx
           ON Tx.objecttype = 'RT::Ticket'
@@ -39,34 +40,81 @@ FROM Tickets t
      JOIN Attachments a
           ON a.transactionid = tx.id
 WHERE t.id = ?
-ORDER BY a.parent
+ORDER BY a.id
 __SQL__
 
 for my $ticket (@ARGV) {
     $sth_att->execute($ticket);
     my $email;
+    my %parts;
+    my $root = 0;
     while ( my $row = $sth_att->fetchrow_hashref ) {
+        my $part_id = $row->{id};
+        my $parent_id = $row->{parent} || $root;
         my $part = Email::MIME->create( attributes => { charset => 'UTF-8' } );
-        prepare_header( $row->{headers}, $part );
-        $part->body_set( $row->{content} );
 
-        # The top part triggers initialization of $email
-        if ( $row->{parent} == 0 ) {
+        prepare_header( $row->{headers}, $part );
+        $part->body_set( $row->{content} ) if $row->{content};
+        $part->header_str_set( 'X-RT-Attachment-Id', $part_id )   if $debug;
+        $part->header_str_set( 'X-RT-Parent-Id',     $parent_id ) if $debug;
+        $parts{$part_id} = { itself => $part, children => [] };
+
+        # Get rid of bogus Date: header added by Email::MIME.
+        # This seems to be an old-standing bug.
+        $part->header_raw_set('date')
+          unless $part->header_str('message-id');
+
+        # The topmost part triggers initialization of $email
+        if ( not defined $email ) {
             $email = $part;
+            $root  = $part_id;
+            print "root part $part_id ", $part->content_type, "\n"
+              if $debug;
+            next;
+        }
+
+        # Identify the parent MIME part
+
+        my $parent = $parts{$root};
+
+        if ( $parent_id != 0 and exists $parts{$parent_id} ) {
+            $parent = $parts{$parent_id};
+        }
+
+        if ( @{ $parent->{children} } == 0
+            and $parent->{itself}->content_type =~ m{(?i)multipart/} )
+        {
+            print "parts_set $part_id → $parent_id ", $part->content_type,
+              "\n"
+              if $debug;
+            $parent->{itself}->parts_set( [$part] );
+            push @{ $parent->{children} }, $part_id;
         }
         else {
-            $email->parts_add( [$part] );
+            print "parts_add $part_id → $parent_id ", $part->content_type,
+              "\n"
+              if $debug;
+
+            push @{ $parent->{children} }, $part_id;
+
+            # This should likely be doable via ->parts_add(), but it does not
+            # really work. For complex structures, specially those found in
+            # spam, the resulting structure is missing parts.
+
+            $parent->{itself}->parts_set(
+                [ map { $parts{$_}->{itself} } @{ $parent->{children} } ] );
         }
     }
+
     my $dest = sprintf( 'rt-%s.eml', $ticket );
     write_file( $dest, $email->as_string )
       or die "Failed to dump ticket $ticket message to $dest: $!";
+
+    printf( "* %s: %s\n%s", $ticket, $email->header_str('subject'), $email->debug_structure ) if $debug;
 }
 
 sub prepare_header {
     my ( $h, $part ) = @_;
-
-    $h =~ s{(?mx)^From \s .+ \n}{};
     my $msg = Email::Simple->new($h);
 
     for my $label ( $msg->header_names ) {
